@@ -25,6 +25,7 @@ putStrLnInfo m = hPutStrLn stderr ("*INFO* " ++ m)
 
 main :: IO ()
 main = do
+    putStrLnInfo "Please consider using the experimental `cabal new-build`-powered generator `make_travis_yml_2.hs`"
     args <- getArgs
     case args of
         (cabfn:xpkgs) -> do genTravisFromCabalFile cabfn xpkgs
@@ -130,7 +131,7 @@ genTravisFromCabalFile fn xpkgs = do
         , " - sed -i -e '1,/^Resolving /d' installplan.txt; cat installplan.txt"
         , ""
         , "# check whether current requested install-plan matches cached package-db snapshot"
-        , " - if diff -u installplan.txt $HOME/.cabsnap/installplan.txt;"
+        , " - if diff -u $HOME/.cabsnap/installplan.txt installplan.txt;"
         , "   then"
         , "     echo \"cabal build-cache HIT\";"
         , "     rm -rfv .ghc;"
@@ -181,8 +182,7 @@ genTravisFromCabalFile fn xpkgs = do
                        , [7,6,1],  [7,6,2], [7,6,3]
                        , [7,8,1],  [7,8,2], [7,8,3], [7,8,4]
                        , [7,10,1], [7,10,2], [7,10,3]
-                       , [7,11] -- HEAD
-                       , [8,0,1]
+                       , [8,0,1],  [8,0,2]
                        , [8,1]  -- HEAD
                        ]
 
