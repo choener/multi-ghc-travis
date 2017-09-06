@@ -22,6 +22,9 @@
 --     is expected to compile/work with at least GHC 7.0 through GHC 8.0
 module Main where
 
+import Control.Applicative ((<|>))
+import Control.DeepSeq (force)
+import Control.Exception (evaluate)
 import Control.Monad
 import Data.Function
 import Data.List
@@ -30,10 +33,13 @@ import System.Console.GetOpt
 import System.Environment
 import System.Exit
 import System.IO
+import Control.Monad.IO.Class
+import Control.Monad.Trans.Writer
+import Text.Read (readMaybe)
 
 import Distribution.Compiler (CompilerFlavor(..))
 import Distribution.Package
-import Distribution.PackageDescription (packageDescription, testedWith, package, condTestSuites)
+import Distribution.PackageDescription (packageDescription, testedWith, package, condLibrary, condTestSuites)
 import Distribution.Text
 import Distribution.Version
 #if MIN_VERSION_Cabal(2,0,0)
@@ -59,19 +65,42 @@ versionNumbers (Version vn _) = vn
 
 #endif
 
-putStrLnErr, putStrLnWarn, putStrLnInfo :: String -> IO ()
-putStrLnErr  m = hPutStrLn stderr ("*ERROR* " ++ m) >> exitFailure
-putStrLnWarn m = hPutStrLn stderr ("*WARNING* " ++ m)
-putStrLnInfo m = hPutStrLn stderr ("*INFO* " ++ m)
+putStrLnErr, putStrLnWarn, putStrLnInfo :: MonadIO m => String -> m ()
+putStrLnErr  m = liftIO $ hPutStrLn stderr ("*ERROR* " ++ m) >> exitFailure
+putStrLnWarn m = liftIO $ hPutStrLn stderr ("*WARNING* " ++ m)
+putStrLnInfo m = liftIO $ hPutStrLn stderr ("*INFO* " ++ m)
 
-putStrLns :: [String] -> IO ()
-putStrLns = putStr . unlines
+-- putStrLns :: [String] -> IO ()
+-- putStrLns = putStr . unlines
+
+tellStrLn :: Monad m => String -> WriterT [String] m ()
+tellStrLn str = tell [str]
+
+tellStrLns :: Monad m => [String] -> WriterT [String] m ()
+tellStrLns = tell
+
+-- | Return the part after the first argument
+--
+-- >>> afterInfix "BAR" "FOOBAR XYZZY"
+-- Just " XYZZY"
+afterInfix :: Eq a => [a] -> [a] -> Maybe [a]
+afterInfix needle haystack = findMaybe (afterPrefix needle) (tails haystack)
+
+afterPrefix :: Eq a => [a] -> [a] -> Maybe [a]
+afterPrefix needle haystack
+    | needle `isPrefixOf` haystack = Just (drop (length needle) haystack)
+    | otherwise                    = Nothing
+
+findMaybe :: (a -> Maybe b) -> [a] -> Maybe b
+findMaybe f = foldr (\a b -> f a <|> b) Nothing
 
 data Options = Options
     { optNoCache :: !Bool
     , optCollections :: [String]
     , optIrcChannels :: [String]
     , optOnlyBranches :: [String]
+    , optOutput :: Maybe FilePath
+    , optRegenerate :: Maybe FilePath
     } deriving Show
 
 defOptions :: Options
@@ -80,6 +109,8 @@ defOptions = Options
     , optIrcChannels = []
     , optCollections = []
     , optOnlyBranches = []
+    , optOutput = Nothing
+    , optRegenerate = Nothing
     }
 
 options :: [OptDescr (Options -> Options)]
@@ -96,18 +127,39 @@ options =
     , Option [] ["branch"]
       (ReqArg (\arg opts -> opts { optOnlyBranches = arg : optOnlyBranches opts }) "BRANCH")
       "enable builds only for specific brances, use multiple times for multiple branches"
+    , Option ['o'] ["output"]
+      (ReqArg (\arg opts -> opts { optOutput = Just arg }) "OUTPUT")
+      "output file (stdout if omitted)"
+    , Option ['r'] ["regerate"]
+      (ReqArg (\arg opts -> opts { optRegenerate = Just arg }) "INPUTOUTPUT")
+      "regenerate the file using the magic command in output file"
     ]
 
 main :: IO ()
 main = do
     argv <- getArgs
-    (opts,cabfn,xpkgs) <- case getOpt Permute options argv of
-      (opts,cabfn:xpkgs,[]) -> return (foldl (flip id) defOptions opts,cabfn,xpkgs)
-      (_,_,[]) -> dieCli ["expected .cabal fle as first non-option argument\n"]
-      (_,_,errs) -> dieCli errs
+    (opts,argv',cabfn,xpkgs) <- parseOpts True argv
+    genTravisFromCabalFile (argv',opts) cabfn xpkgs
 
-    genTravisFromCabalFile (argv,opts) cabfn xpkgs
+
+parseOpts :: Bool -> [String] -> IO (Options, [String], FilePath, [String])
+parseOpts regenerate argv = case getOpt Permute options argv of
+    (opts',_,[])
+      | regenerate, Just fp <- optRegenerate opts -> do
+        ls <- fmap lines (readFile fp >>= evaluate . force) -- strict IO
+        case findArgv ls of
+          Nothing    -> dieCli ["expected REGENDATA line in " ++ fp ++ "\n"]
+          Just argv' -> parseOpts False argv'
+      where opts = foldl (flip id) defOptions opts'
+    (opts,cabfn:xpkgs,[]) -> return (foldl (flip id) defOptions opts,argv,cabfn,xpkgs)
+    (_,_,[]) -> dieCli ["expected .cabal fle as first non-option argument\n"]
+    (_,_,errs) -> dieCli errs
   where
+    findArgv :: [String] -> Maybe [String]
+    findArgv ls = do
+        l <- findMaybe (afterInfix "REGENDATA") ls
+        readMaybe l
+
     dieCli errs = hPutStrLn stderr (usageMsg errs) >> exitFailure
     usageMsg errs = concat (map ("*ERROR* "++) errs) ++ usageInfo h options ++ ex
     h = concat
@@ -119,12 +171,19 @@ main = do
     ex = unlines
         [ ""
         , "Example:"
-        , "  make_travis_yml_2.hs someProject.cabal liblzma-dev > .travis.yml"
+        , "  make_travis_yml_2.hs -o .travis.yml someProject.cabal liblzma-dev"
         ]
 
+runFileWriter :: Maybe FilePath -> WriterT [String] IO () -> IO ()
+runFileWriter mfp m = do
+    contents <- fmap unlines (execWriterT m)
+    case mfp of
+        Nothing -> putStr contents
+        Just fp -> writeFile fp contents
+
 genTravisFromCabalFile :: ([String],Options) -> FilePath -> [String] -> IO ()
-genTravisFromCabalFile (argv,opts) fn xpkgs = do
-    gpd <- readGenericPackageDescription maxBound fn
+genTravisFromCabalFile (argv,opts) fn xpkgs = runFileWriter (optOutput opts) $ do
+    gpd <- liftIO $ readGenericPackageDescription maxBound fn
 
     let compilers = testedWith $ packageDescription $ gpd
         pkgNameStr = display $ pkgName $ package $ packageDescription gpd
@@ -183,7 +242,7 @@ genTravisFromCabalFile (argv,opts) fn xpkgs = do
     ----------------------------------------------------------------------------
     -- travis.yml generation starts here
 
-    putStrLns
+    tellStrLns
         [ "# This Travis job script has been generated by a script via"
         , "#"
         , ("#   make_travis_yml_2.hs " ++ unwords [ "'" ++ a ++ "'" | a <- argv ])
@@ -198,7 +257,7 @@ genTravisFromCabalFile (argv,opts) fn xpkgs = do
         , ""
         ]
 
-    unless (null $ optIrcChannels opts) $ putStrLns $
+    unless (null $ optIrcChannels opts) $ tellStrLns $
         [ "notifications:"
         , "  irc:"
         , "    channels:"
@@ -210,7 +269,7 @@ genTravisFromCabalFile (argv,opts) fn xpkgs = do
         , ""
         ]
 
-    unless (null $ optOnlyBranches opts) $ putStrLns $
+    unless (null $ optOnlyBranches opts) $ tellStrLns $
         [ "branches:"
         , "  only:"
         ] ++
@@ -220,7 +279,7 @@ genTravisFromCabalFile (argv,opts) fn xpkgs = do
         [ ""
         ]
 
-    unless (optNoCache opts) $ putStrLns
+    unless (optNoCache opts) $ tellStrLns
         [ "cache:"
         , "  directories:"
         , "    - $HOME/.cabal/packages"
@@ -237,8 +296,8 @@ genTravisFromCabalFile (argv,opts) fn xpkgs = do
         , ""
         ]
 
-    putStrLn "matrix:"
-    putStrLn "  include:"
+    tellStrLn "matrix:"
+    tellStrLn "  include:"
 
     let colls = [ (collToGhcVer cid,cid) | cid <- reverse $ optCollections opts ]
 
@@ -250,7 +309,7 @@ genTravisFromCabalFile (argv,opts) fn xpkgs = do
 
             colls' = [ cid | (v,cid) <- colls, v == gv ]
 
-        putStrLns
+        tellStrLns
             [ concat [ "    - compiler: \"ghc-", gvs, "\"" ]
             , if null colls' then
                        "    # env: TEST=--disable-tests BENCH=--disable-benchmarks"
@@ -263,39 +322,42 @@ genTravisFromCabalFile (argv,opts) fn xpkgs = do
     let headGhcVers = filter isHead testedGhcVersions
 
     unless (null headGhcVers) $ do
-        putStrLn ""
-        putStrLn "  allow_failures:"
+        tellStrLn ""
+        tellStrLn "  allow_failures:"
 
     forM_ headGhcVers $ \gv -> do
         let gvs = disp' gv
-        putStrLn $ concat [ "    - compiler: \"ghc-", gvs, "\"" ]
+        tellStrLn $ concat [ "    - compiler: \"ghc-", gvs, "\"" ]
 
-    putStrLns
+    tellStrLns
         [ ""
         , "before_install:"
         , " - HC=${CC}"
+        , " - HCPKG=${HC/ghc/ghc-pkg}"
         , " - unset CC"
         , " - PATH=/opt/ghc/bin:/opt/ghc-ppa-tools/bin:$PATH"
         , " - PKGNAME='" ++ pkgNameStr ++ "'"
         ]
 
     unless (null colls) $
-       putStrLn " - IFS=', ' read -a COLLS <<< \"$COLLECTIONS\""
+       tellStrLn " - IFS=', ' read -a COLLS <<< \"$COLLECTIONS\""
 
-    putStrLns
+    tellStrLns
         [ ""
         , "install:"
         , " - cabal --version"
         , " - echo \"$(${HC} --version) [$(${HC} --print-project-git-commit-id 2> /dev/null || echo '?')]\""
         , " - BENCH=${BENCH---enable-benchmarks}"
         , " - TEST=${TEST---enable-tests}"
+        , " - HADDOCK=${HADDOCK-true}"
+        , " - INSTALLED=${INSTALLED-true}"
         , " - travis_retry cabal update -v"
-        , " - sed -i 's/^jobs:/-- jobs:/' ${HOME}/.cabal/config"
+        , " - sed -i.bak 's/^jobs:/-- jobs:/' ${HOME}/.cabal/config"
         , " - rm -fv cabal.project.local"
         , " - \"echo 'packages: .' > cabal.project\""
         ]
 
-    unless (null colls) $ putStrLns
+    unless (null colls) $ tellStrLns
         [ " - for COLL in \"${COLLS[@]}\"; do"
         , "     echo \"== collection $COLL ==\";"
         , "     ghc-travis collection ${COLL} > /dev/null || break;"
@@ -306,7 +368,7 @@ genTravisFromCabalFile (argv,opts) fn xpkgs = do
         , "   done"
         ]
 
-    putStrLns
+    tellStrLns
         [ " - rm -f cabal.project.freeze"
         , " - cabal new-build -w ${HC} ${TEST} ${BENCH} --dep -j2 all"
         , " - cabal new-build -w ${HC} --disable-tests --disable-benchmarks --dep -j2 all"
@@ -333,21 +395,36 @@ genTravisFromCabalFile (argv,opts) fn xpkgs = do
         , ""
         ]
 
-    putStrLns
-        [ " # build & run tests"
+    tellStrLns
+        [ " # Build with installed constraints for packages in global-db"
+        , " - if $INSTALLED; then"
+        , "     echo cabal new-build -w ${HC} --disable-tests --disable-benchmarks $(${HCPKG} list --global --simple-output --names-only | sed 's/\\([a-zA-Z0-9-]\\{1,\\}\\) */--constraint=\"\\1 installed\" /g') all | sh;"
+        , "   else echo \"Not building with installed constraints\"; fi"
+        , ""
+        ]
+
+    tellStrLns
+        [ " # build & run tests, build benchmarks"
         , " - cabal new-build -w ${HC} ${TEST} ${BENCH} all"
         ]
 
     -- cabal new-test fails if there are no test-suites.
-    unless (null $ condTestSuites gpd) $ putStrLns
+    unless (null $ condTestSuites gpd) $ tellStrLns
         [ " - if [ \"x$TEST\" = \"x--enable-tests\" ]; then cabal new-test -w ${HC} ${TEST} all; fi"
         ]
 
-    putStrLns
+    tellStrLns
         [ ""
         ]
 
-    unless (null colls) $ putStrLns
+    unless (isNothing $ condLibrary gpd) $ tellStrLns
+        [ " # haddock"
+        , " - rm -rf ./dist-newstyle"
+        , " - if $HADDOCK; then cabal new-haddock -w ${HC} --disable-tests --disable-benchmarks all; else echo \"Skipping haddock generation\";fi"
+        , ""
+        ]
+
+    unless (null colls) $ tellStrLns
         [ " # try building & testing for package collections"
         , " - for COLL in \"${COLLS[@]}\"; do"
         , "     echo \"== collection $COLL ==\";"
@@ -361,7 +438,10 @@ genTravisFromCabalFile (argv,opts) fn xpkgs = do
         , ""
         ]
 
-    putStrLn "# EOF"
+    tellStrLns
+        [ "# REGENDATA " ++ show argv
+        , "# EOF"
+        ]
 
     return ()
   where
