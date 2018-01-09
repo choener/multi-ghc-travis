@@ -1,0 +1,12 @@
+packages:
+  servant/
+  servant-client/
+  servant-docs/
+  servant-server/
+
+constraints: foundatiion >= 0.14
+allow-newer:
+  servant-js:servant
+allow-newer:
+  servant-js:servant-foreign
+allow-newer:
