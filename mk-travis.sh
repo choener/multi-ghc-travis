@@ -1,4 +1,5 @@
-#!/bin/env zsh
+#! /usr/bin/env nix-shell
+#! nix-shell -p ghc -i zsh
 
 # prepare travis file with everything we need
 
