@@ -1,4 +1,4 @@
-Multiple [GHC](http://haskell.org/ghc) Versions for [Travis-CI](https://travis-ci.org)
+Multiple [GHC](http://haskell.org/ghc) Versions for [Travis-CI](https://travis-ci.org) [![Build](https://img.shields.io/travis/haskell-CI/haskell-ci.svg)](https://travis-ci.org/haskell-CI/haskell-ci)
 ============================================================
 
 The purpose of this document is to describe how to set up the [`.travis.yml` script](http://about.travis-ci.org/docs/user/build-configuration/) in order to build and test your [cabalized](http://www.haskell.org/cabal) Haskell package with multiple [GHC](http://haskell.org/ghc) configurations.
@@ -13,7 +13,8 @@ At time of writing [Travis-CI](https://travis-ci.org/) has [support for building
  - GHC 7.10.1, GHC 7.10.2, GHC 7.10.3
  - GHC 8.0.1, GHC 8.0.2
  - GHC 8.2.1, GHC 8.2.2
- - GHC 8.4.1 *(alpha pre-release)*
+ - GHC 8.4.1, GHC 8.4.2, GHC 8.4.3
+ - GHC 8.6.1 *(pre-release snapshot)*
  - GHC HEAD.
 
 Each GHC version is provided in a separate `ghc-<version>` `.deb` package installing into `/opt/ghc/<version>` (thus allowing to be installed at the same time if needed) published in a [PPA](https://launchpad.net/~hvr/+archive/ghc). The easiest way to "activate" a particular GHC version is to prepend its `bin`-folder to the `$PATH` environment variable (see example in next section).
@@ -25,9 +26,15 @@ Note: For actually enabling continuous integration for a GitHub hosted project, 
 * Step 1: Clone this project in any directory
 
     ```bash
-    $ git clone https://github.com/hvr/multi-ghc-travis.git
+    $ git clone https://github.com/haskell-CI/haskell-ci.git
     ```
-    
+
+  or
+
+    ```bash
+    cabal get -s haskell-ci
+    ```
+
 * Step 2: Change directories to your project:
 
     ```bash
@@ -49,8 +56,8 @@ Note: For actually enabling continuous integration for a GitHub hosted project, 
 
     ```bash
     $ # You run the following command from your project's directory, even
-    $ # though it references the script from the `multi-ghc-travis` project
-    $ path/to/multi-ghc-travis/make_travis_yml.hs your-project.cabal > .travis.yml
+    $ # though it references the script from the `haskell-ci` project
+    $ path/to/haskell-ci/make_travis_yml.hs your-project.cabal > .travis.yml
     ```
     
     The `make_travis_yml.hs` script looks at the `Tested-With` line in your

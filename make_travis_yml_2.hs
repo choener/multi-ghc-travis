@@ -16,7 +16,7 @@
 -- | New-style @.travis.yml@ script generator using cabal 1.24's nix-style
 -- tech-preview facilities.
 --
--- See also <https://github.com/hvr/multi-ghc-travis>
+-- See also <https://github.com/haskell-CI/haskell-ci>
 --
 -- NB: This code deliberately avoids relying on non-standard packages and
 --     is expected to compile/work with at least GHC 7.0 through GHC 8.0
@@ -30,17 +30,17 @@ module MakeTravisYml (
     travisFromConfigFile, MakeTravisOutput, Options (..), defOptions, options,
     ) where
 
-import Control.Applicative ((<$>),(<|>), pure)
+import Control.Applicative as App ((<$>),(<|>), pure)
 import Control.DeepSeq (force)
 import Control.Exception (evaluate)
-import Control.Monad (void, when, unless, filterM, liftM, liftM2, forM_, mzero, foldM)
+import Control.Monad (void, when, unless, filterM, liftM, liftM2, forM_, mzero, foldM, join)
 import Data.Char (isSpace, isUpper, toLower)
 import qualified Data.Foldable as F
 import qualified Data.Traversable as T
 import Data.Function
 import Data.List
 import Data.Maybe
-import Data.Monoid (Monoid (..), Endo (..))
+import Data.Monoid as Mon (Monoid (..), Endo (..))
 import Data.Either (partitionEithers)
 import Data.Set (Set)
 import qualified Data.Set as S
@@ -66,7 +66,9 @@ import qualified Distribution.PackageDescription as PD
 import qualified Distribution.ParseUtils as PU
 import Distribution.Text
 import Distribution.Version
-#if MIN_VERSION_Cabal(2,0,0)
+#if MIN_VERSION_Cabal(2,2,0)
+import Distribution.PackageDescription.Parsec (readGenericPackageDescription)
+#elif MIN_VERSION_Cabal(2,0,0)
 import Distribution.PackageDescription.Parse (readGenericPackageDescription)
 #else
 import Distribution.PackageDescription.Parse (readPackageDescription)
@@ -75,15 +77,13 @@ import Distribution.Verbosity (Verbosity)
 import Distribution.Compat.ReadP
     ( ReadP, (<++), (+++), between, char, many1, munch1
     , pfail, readP_to_S, readS_to_P, look
-    , satisfy, sepBy, sepBy1, gather)
+    , satisfy, sepBy, sepBy1, gather, munch, skipSpaces)
 
 #ifdef MIN_VERSION_ShellCheck
 import ShellCheck.Checker (checkScript)
 import qualified ShellCheck.Interface as SC
 import qualified ShellCheck.Formatter.Format as SC
 import qualified ShellCheck.Formatter.TTY as SC.TTY
-
-import Data.Functor.Identity (Identity (..))
 import System.IO.Unsafe (unsafePerformIO)
 #endif
 
@@ -119,20 +119,34 @@ knownGhcVersions = fmap mkVersion
     , [7,6,1],  [7,6,2], [7,6,3]
     , [7,8,1],  [7,8,2], [7,8,3], [7,8,4]
     , [7,10,1], [7,10,2], [7,10,3]
-    , [8,0,1], [8,0,2]
-    , [8,2,1], [8,2,2]
-    , [8,4,1]
-    , [8,5] -- HEAD
+    , [8,0,1],  [8,0,2]
+    , [8,2,1],  [8,2,2]
+    , [8,4,1],  [8,4,2], [8,4,3]
+    , [8,6,1]
     ]
 
 ghcAlpha :: Maybe Version
-ghcAlpha = Just $ mkVersion [8,4,1]
+-- ghcAlpha = Nothing
+ghcAlpha = Just (mkVersion [8,6,1])
+
+cabalVerMap :: [((Int, Int), Maybe Version)]
+cabalVerMap = fmap (fmap (fmap mkVersion))
+    [ ((7, 0), Just [2,2]) -- Use 2.2 for everything.
+    , ((7, 2), Just [2,2])
+    , ((7, 4), Just [2,2])
+    , ((7, 6), Just [2,2])
+    , ((7, 8), Just [2,2])
+    , ((7,10), Just [2,2])
+    , ((8, 0), Just [2,2])
+    , ((8, 2), Just [2,2])
+    , ((8, 4), Just [2,2])
+    ]
 
 defaultHLintVersion :: VersionRange
-defaultHLintVersion = withinVersion (mkVersion [2,0])
+defaultHLintVersion = withinVersion (mkVersion [2,1])
 
 defaultDoctestVersion :: VersionRange
-defaultDoctestVersion = withinVersion (mkVersion [0,13])
+defaultDoctestVersion = withinVersion (mkVersion [0,16])
 
 -------------------------------------------------------------------------------
 -- Script
@@ -150,17 +164,18 @@ sh' :: [Integer] -> String -> String
 #ifndef MIN_VERSION_ShellCheck
 sh' _ = shImpl
 #else
-sh' excl cmd = case checkScript iface spec of
-    Identity res@(SC.CheckResult _ comments)
-        | null comments -> shImpl cmd
-        -- this is ugly use of unsafePerformIO
-        -- but whole ShellCheck here is a little like `traceShow` anyway.
-        | otherwise     -> unsafePerformIO $ do
-            SC.onResult scFormatter res cmd
-            fail "ShellCheck!"
+sh' excl cmd = unsafePerformIO $ do
+  res <- checkScript iface spec
+  case res of
+    (SC.CheckResult _ []) -> return (shImpl cmd)
+    _                     -> SC.onResult scFormatter res iface >> fail "ShellCheck!"
   where
     iface = SC.SystemInterface $ \n -> return $ Left $ "cannot read file: " ++ n
-    spec  = SC.CheckSpec "stdin" cmd excl (Just SC.Sh)
+    spec  = SC.emptyCheckSpec { SC.csFilename = "stdin"
+                              , SC.csScript = cmd
+                              , SC.csExcludedWarnings = excl
+                              , SC.csShellTypeOverride = Just SC.Sh
+                              }
 
 scFormatter :: SC.Formatter
 scFormatter = unsafePerformIO (SC.TTY.format (SC.FormatterOptions SC.ColorAlways))
@@ -267,7 +282,7 @@ afterPrefix needle haystack
 -- Just 1
 --
 findMaybe :: (a -> Maybe b) -> [a] -> Maybe b
-findMaybe f = foldr (\a b -> f a <|> b) Nothing
+findMaybe f = foldr (\a b -> f a App.<|> b) Nothing
 
 -- | >>> maybeReadP PU.parseTokenQ' "foo"
 -- Just "foo"
@@ -292,8 +307,24 @@ parseOpts argv = case argv of
         case findArgv ls of
             Nothing     -> dieCli [Error $ "expected REGENDATA line in " ++ fp ++ "\n"]
             Just argv'' -> parseOpts argv''
+    [cmd] | cmd `isPrefixOf` "list-ghc" -> do
+        putStrLn $ "Supported GHC versions:"
+        forM_ groupedVersions $ \(v, vs) -> do
+            putStr $ prettyMajVersion v ++ ": "
+            putStrLn $ intercalate ", " (map display vs)
+        exitSuccess
     _ -> parseOptsNoCommands argv
   where
+    groupedVersions :: [(Version, [Version])]
+    groupedVersions = map ((\vs -> (head vs, vs)) . sortBy (flip compare))
+                    . groupBy ((==) `on` ghcMajVer)
+                    $ sort knownGhcVersions
+
+    prettyMajVersion :: Version -> String
+    prettyMajVersion v
+        | Just v == ghcAlpha = "alpha"
+        | otherwise = case ghcMajVer v of (x,y) -> show x ++ "." ++ show y
+
     findArgv :: [String] -> Maybe [String]
     findArgv ls = do
         l <- findMaybe (afterInfix "REGENDATA") ls
@@ -328,6 +359,7 @@ dieCli errs = hPutStrLn stderr (usageMsg errs) >> exitFailure
         , ""
         , "Available commands:"
         , "    regenerate [TRAVIS.YAML]  Regenerate the file using the magic command in it. Default .travis.yml"
+        , "    list-ghc                  List GHC versions supported by this version of make-travis-yml"
         , ""
         , "Available options:"
         ]
@@ -355,20 +387,12 @@ ghcMajVer v
     | x:y:_ <- versionNumbers v = (x,y)
     | otherwise = error $ "panic: ghcMajVer called with " ++ show v
 
-isGhcHead :: Version -> Bool
-isGhcHead v
-    | (_,y) <- ghcMajVer v = odd y || Just v == ghcAlpha
-    | otherwise            = False
+-- | Alphas, RCs and HEAD.
+previewGHC :: Maybe Version -> Bool
+previewGHC = maybe True $ \v -> Just v == ghcAlpha || odd (snd (ghcMajVer v))
 
-isGhcOdd :: Version -> Bool
-isGhcOdd v
-    | (_,y) <- ghcMajVer v = odd y
-    | otherwise            = False
-
-dispGhcVersion :: Version -> String
-dispGhcVersion v
-    | isGhcOdd v = "head"
-    | otherwise = display v
+dispGhcVersion :: Maybe Version -> String
+dispGhcVersion = maybe "head" display
 
 data Package = Pkg
     { pkgName :: String
@@ -388,10 +412,10 @@ travisFromConfigFile
     -> YamlWriter m ()
 travisFromConfigFile args@(_, opts) path xpkgs = do
     cabalFiles <- getCabalFiles
-    pkgs <- T.mapM (configFromCabalFile opts) cabalFiles
     config' <- maybe (return emptyConfig) readConfigFile (optConfig opts)
-    (ghcs, prj) <- checkVersions pkgs
     let config = optConfigMorphism opts config'
+    pkgs <- T.mapM (configFromCabalFile config opts) cabalFiles
+    (ghcs, prj) <- checkVersions pkgs
     genTravisFromConfigs args xpkgs isCabalProject config prj ghcs
   where
     checkVersions
@@ -415,9 +439,9 @@ travisFromConfigFile args@(_, opts) path xpkgs = do
           where
             symDiff a b = S.union a b `S.difference` S.intersection a b
             diff = symDiff testWith allVersions
-            missingVersions = map dispGhcVersion $ S.toList diff
+            missingVersions = map display $ S.toList diff
             errors | S.null diff = []
-                   | otherwise = pure $ mconcat
+                   | otherwise = App.pure $ mconcat
                         [ pkgName pkg
                         , " is missing tested-with annotations for: "
                         ] ++ intercalate "," missingVersions
@@ -471,8 +495,8 @@ travisFromConfigFile args@(_, opts) path xpkgs = do
             Just x  -> return (Just x)
 
 configFromCabalFile
-    :: MonadIO m => Options -> FilePath -> YamlWriter m (Package, Set Version)
-configFromCabalFile opts cabalFile = do
+    :: MonadIO m => Config ->  Options -> FilePath -> YamlWriter m (Package, Set Version)
+configFromCabalFile cfg opts cabalFile = do
     gpd <- liftIO $ readGenericPackageDescription maxBound cabalFile
 
     let compilers = testedWith $ packageDescription gpd
@@ -514,7 +538,11 @@ configFromCabalFile opts cabalFile = do
                      ++ intercalate ", " (map display unknownGhcVers) ++ "\n"
                      ++ "Known GHC versions: " ++ intercalate ", " (map display knownGhcVersions))
 
-    let testedGhcVersions = filter (`withinRange` ghcVerConstrs') knownGhcVersions
+    let knownGhcVersions'
+            | cfgLastInSeries cfg = filterLastMajor knownGhcVersions
+            | otherwise           = knownGhcVersions
+
+    let testedGhcVersions = filter (`withinRange` ghcVerConstrs') knownGhcVersions'
 
     when (null testedGhcVersions) $ do
         putStrLnErr "no known GHC version is allowed by the 'tested-with' specification"
@@ -523,21 +551,27 @@ configFromCabalFile opts cabalFile = do
         let v = collToGhcVer c
         unless (v `elem` testedGhcVersions) $
             putStrLnErr $ unlines
-               [ "collection " ++ c ++ " requires GHC " ++ dispGhcVersion v
-               , "add 'tested-width: GHC == " ++ dispGhcVersion v ++ "' to your .cabal file"
+               [ "collection " ++ c ++ " requires GHC " ++ display v
+               , "add 'tested-width: GHC == " ++ display v ++ "' to your .cabal file"
                ]
 
     let pkg = Pkg pkgNameStr (takeDirectory cabalFile) gpd
 
     return (pkg, S.fromList testedGhcVersions)
   where
-    lastStableGhcVers = nubBy ((==) `on` ghcMajVer) $ filter (not . isGhcHead) $ sortBy (flip compare) knownGhcVersions
+    lastStableGhcVers
+        = nubBy ((==) `on` ghcMajVer)
+        $ sortBy (flip compare)
+        $ filter (not . previewGHC . Just)
+        $ knownGhcVersions
 
     isTwoDigitGhcVersion :: VersionRange -> Maybe Version
     isTwoDigitGhcVersion vr = isSpecificVersion vr >>= t
       where
         t v | [_,_] <- versionNumbers v = Just v
         t _                             = Nothing
+
+    filterLastMajor = map maximum . groupBy ((==) `on` ghcMajVer)
 
 genTravisFromConfigs
     :: Monad m
@@ -548,7 +582,7 @@ genTravisFromConfigs
     -> Project Package
     -> Set Version
     -> YamlWriter m ()
-genTravisFromConfigs (argv,opts) xpkgs isCabalProject config prj@Project { prjPackages = pkgs } versions = do
+genTravisFromConfigs (argv,opts) xpkgs isCabalProject config prj@Project { prjPackages = pkgs } versions' = do
     let folds = cfgFolds config
 
     putStrLnInfo $
@@ -567,7 +601,7 @@ genTravisFromConfigs (argv,opts) xpkgs isCabalProject config prj@Project { prjPa
         , "#"
         , "#   runghc make_travis_yml_2.hs " ++ unwords [ "'" ++ a ++ "'" | a <- argv ]
         , "#"
-        , "# For more information, see https://github.com/hvr/multi-ghc-travis"
+        , "# For more information, see https://github.com/haskell-CI/haskell-ci"
         , "#"
         , "language: c"
         , "sudo: false"
@@ -633,19 +667,22 @@ genTravisFromConfigs (argv,opts) xpkgs isCabalProject config prj@Project { prjPa
 
     let colls = [ (collToGhcVer cid,cid) | cid <- reverse $ optCollections opts ]
 
-    let tellJob osx gv = do
-            let cvs = dispGhcVersion (lookupCabVer gv)
+    let tellJob :: Monad m => Bool -> Maybe Version -> YamlWriter m ()
+        tellJob osx gv = do
+            let cvs = dispGhcVersion $ cfgCabalInstallVersion config <|> (lookupCabVer =<< gv)
                 gvs = dispGhcVersion gv
 
                 xpkgs' = concatMap (',':) xpkgs
 
-                colls' = [ cid | (v,cid) <- colls, v == gv ]
+                colls' = [ cid | (v,cid) <- colls, Just v == gv ]
 
             tellStrLns
                 [ "    - compiler: \"ghc-" <> gvs <> "\""
-                , if | isGhcHead gv -> "      env: GHCHEAD=true"
-                     | null colls'  -> "    # env: TEST=--disable-tests BENCH=--disable-benchmarks"
-                     | otherwise    -> "      env: 'COLLECTIONS=" ++ intercalate "," colls' ++ "'"
+                , if | Just e <- gv >>= \v -> M.lookup v (cfgEnv config)
+                                     -> "      env: " ++ e
+                     | previewGHC gv -> "      env: GHCHEAD=true"
+                     | null colls'   -> "    # env: TEST=--disable-tests BENCH=--disable-benchmarks"
+                     | otherwise     -> "      env: 'COLLECTIONS=" ++ intercalate "," colls' ++ "'"
                 , "      addons: {apt: {packages: [ghc-ppa-tools,cabal-install-" <> cvs <> ",ghc-" <> gvs <> xpkgs' <> "], sources: [hvr-ghc]}}"
                 ]
 
@@ -653,16 +690,19 @@ genTravisFromConfigs (argv,opts) xpkgs isCabalProject config prj@Project { prjPa
                 [ "      os: osx"
                 ]
 
-    F.forM_ versions $ tellJob False
-    F.forM_ osxVersions $ tellJob True
+    -- newer GHC first, -head last (which is great).
+    -- Alpha release would go first though.
+    F.forM_ (reverse $ S.toList versions) $ tellJob False
+    F.forM_ (reverse $ S.toList osxVersions) $ tellJob True . Just
 
-    unless (S.null headGhcVers) $ do
+    let allowFailures = headGhcVers `S.union` S.map Just (cfgAllowFailures config)
+    unless (S.null allowFailures) $ do
         tellStrLn ""
         tellStrLn "  allow_failures:"
 
-    F.forM_ headGhcVers $ \gv -> do
-        let gvs = dispGhcVersion gv
-        tellStrLn $ concat [ "    - compiler: \"ghc-", gvs, "\"" ]
+        F.forM_ allowFailures $ \gv -> do
+            let gvs = dispGhcVersion gv
+            tellStrLn $ concat [ "    - compiler: \"ghc-", gvs, "\"" ]
 
     tellStrLns
         [ ""
@@ -682,7 +722,7 @@ genTravisFromConfigs (argv,opts) xpkgs isCabalProject config prj@Project { prjPa
         [ sh "PATH=/opt/ghc/bin:/opt/ghc-ppa-tools/bin:$HOME/local/bin:$PATH"
         ]
     else tellStrLns
-        [ sh $ "if [ \"$(uname)\" = \"Darwin\" ]; then brew update; brew install python3; curl " ++ haskellOnMacos ++ " | python3 - --make-dirs --install-dir=$HOME/.ghc-install --cabal-alias=head install cabal-install-head ${HC}; fi"
+        [ sh $ "if [ \"$(uname)\" = \"Darwin\" ]; then brew update; brew upgrade python@3; curl " ++ haskellOnMacos ++ " | python3 - --make-dirs --install-dir=$HOME/.ghc-install --cabal-alias=head install cabal-install-head ${HC}; fi"
         , sh $ "if [ \"$(uname)\" = \"Darwin\" ]; then PATH=$HOME/.ghc-install/ghc/bin:$HOME/local/bin:$PATH; else PATH=/opt/ghc/bin:/opt/ghc-ppa-tools/bin:$HOME/local/bin:$PATH; fi"
         ]
 
@@ -703,7 +743,8 @@ genTravisFromConfigs (argv,opts) xpkgs isCabalProject config prj@Project { prjPa
         , sh "BENCH=${BENCH---enable-benchmarks}"
         , sh "TEST=${TEST---enable-tests}"
         , sh "HADDOCK=${HADDOCK-true}"
-        , sh "INSTALLED=${INSTALLED-true}"
+        , sh "UNCONSTRAINED=${UNCONSTRAINED-true}"
+        , sh "NOINSTALLEDCONSTRAINTS=${NOINSTALLEDCONSTRAINTS-false}"
         , sh "GHCHEAD=${GHCHEAD-false}"
         ]
 
@@ -734,9 +775,8 @@ genTravisFromConfigs (argv,opts) xpkgs isCabalProject config prj@Project { prjPa
         [ "  # Overlay Hackage Package Index for GHC HEAD: https://github.com/hvr/head.hackage"
         , "  - |"
         , "    if $GHCHEAD; then"
-        --  See: https://ghc.haskell.org/trac/ghc/wiki/Commentary/Libraries/VersionHistory
-        --  other packages don't have major bumps GHC-8.2.2 -> GHC-8.4.1 (2018-01-03)
-        , "      sed -i.bak 's/-- allow-newer:.*/allow-newer: *:base, *:template-haskell, *:ghc, *:Cabal/' ${HOME}/.cabal/config"
+        , "      sed -i 's/-- allow-newer: .*/allow-newer: *:base/' ${HOME}/.cabal/config"
+        , "      for pkg in $($HCPKG list --simple-output); do pkg=$(echo $pkg | sed 's/-[^-]*$//'); sed -i \"s/allow-newer: /allow-newer: *:$pkg, /\" ${HOME}/.cabal/config; done"
         , ""
         , "      echo 'repository head.hackage'                                                        >> ${HOME}/.cabal/config"
         , "      echo '   url: http://head.hackage.haskell.org/'                                       >> ${HOME}/.cabal/config"
@@ -745,6 +785,8 @@ genTravisFromConfigs (argv,opts) xpkgs isCabalProject config prj@Project { prjPa
         , "      echo '              2e8555dde16ebd8df076f1a8ef13b8f14c66bad8eafefd7d9e37d0ed711821fb' >> ${HOME}/.cabal/config"
         , "      echo '              8f79fd2389ab2967354407ec852cbe73f2e8635793ac446d09461ffb99527f6e' >> ${HOME}/.cabal/config"
         , "      echo '   key-threshold: 3'                                                            >> ${HOME}/.cabal.config"
+        , ""
+        , "      grep -Ev -- '^\\s*--' ${HOME}/.cabal/config | grep -Ev '^\\s*$'"
         , ""
         , "      cabal new-update head.hackage -v"
         , "    fi"
@@ -760,7 +802,7 @@ genTravisFromConfigs (argv,opts) xpkgs isCabalProject config prj@Project { prjPa
             | isAnyVersion (cfgDoctestVersion config) = ""
             | otherwise = " --constraint='doctest " ++ display (cfgDoctestVersion config) ++ "'"
     when (cfgDoctest config) $ tellStrLns
-        [ sh $ "if [ $HCNUMVER -ge 80000 ]; then cabal new-install -w ${HC} --symlink-bindir=$HOME/.local/bin doctest" ++ doctestVersionConstraint ++ "; fi"
+        [ sh $ "if [ $HCNUMVER -ge 80000 ]; then cabal new-install -w ${HC} -j2 --symlink-bindir=$HOME/.local/bin doctest" ++ doctestVersionConstraint ++ "; fi"
         ]
 
     -- Install hlint
@@ -768,7 +810,7 @@ genTravisFromConfigs (argv,opts) xpkgs isCabalProject config prj@Project { prjPa
             | isAnyVersion (cfgHLintVersion config) = ""
             | otherwise = " --constraint='hlint " ++ display (cfgHLintVersion config) ++ "'"
     when (cfgHLint config) $ tellStrLns
-        [ sh $ "if [ $HCNUMVER -eq 80202 ]; then cabal new-install -w ${HC} --symlink-bindir=$HOME/.local/bin hlint" ++ hlintVersionConstraint ++ "; fi"
+        [ sh $ "if [ $HCNUMVER -eq 80403 ]; then cabal new-install -w ${HC} -j2 --symlink-bindir=$HOME/.local/bin hlint" ++ hlintVersionConstraint ++ "; fi"
         ]
 
     -- create cabal.project file
@@ -795,7 +837,7 @@ genTravisFromConfigs (argv,opts) xpkgs isCabalProject config prj@Project { prjPa
         ]
 
     let quotedRmPaths =
-          quotedPaths (\Pkg{pkgDir} -> pkgDir ++ "/.ghc.environment.*")
+          ".ghc.environment.*"
           ++ " " ++
           quotedPaths (\Pkg{pkgDir} -> pkgDir ++ "/dist")
 
@@ -849,19 +891,6 @@ genTravisFromConfigs (argv,opts) xpkgs isCabalProject config prj@Project { prjPa
 
     tellStrLns [""]
 
-    when (cfgInstalled config) $ foldedTellStrLns FoldBuildInstalled
-        "Building with installed constraints for package in global-db..." folds $ tellStrLns
-        [ comment "Build with installed constraints for packages in global-db"
-        -- SC2046: Quote this to prevent word splitting.
-        -- here we split on purpose!
-        , sh' [2046, 2086] $ unwords
-            [ "if $INSTALLED;"
-            , "then echo cabal new-build -w ${HC} --disable-tests --disable-benchmarks $(${HCPKG} list --global --simple-output --names-only | sed 's/\\([a-zA-Z0-9-]\\{1,\\}\\) */--constraint=\"\\1 installed\" /g') all | sh;"
-            , "else echo \"Not building with installed constraints\"; fi"
-            ]
-        ]
-
-    tellStrLns [""]
 
     foldedTellStrLns FoldBuildEverything
         "Building with tests and benchmarks..." folds $ tellStrLns
@@ -888,7 +917,7 @@ genTravisFromConfigs (argv,opts) xpkgs isCabalProject config prj@Project { prjPa
     tellStrLns [""]
 
     when (cfgDoctest config) $ do
-        let doctestOptions = unwords $ map (show . PU.showToken) $ cfgDoctestOptions config
+        let doctestOptions = unwords $ cfgDoctestOptions config
         tellStrLns [ comment "doctest" ]
         foldedTellStrLns FoldDoctest "Doctest..." folds $ do
             forM_ pkgs $ \Pkg{pkgName,pkgGpd} -> do
@@ -900,7 +929,15 @@ genTravisFromConfigs (argv,opts) xpkgs isCabalProject config prj@Project { prjPa
         tellStrLns [ "" ]
 
     when (cfgHLint config) $ do
-        let hlintOptions = maybe "" (" -h ${ROOTDIR}/" ++) (cfgHLintYaml config)
+        let "" <+> ys = ys
+            xs <+> "" = xs
+            xs <+> ys = xs ++ " " ++ ys
+
+            prependSpace "" = ""
+            prependSpace xs = " " ++ xs
+
+        let hlintOptions = prependSpace $ maybe "" ("-h ${ROOTDIR}/" ++) (cfgHLintYaml config) <+> unwords (cfgHLintOptions config)
+
         tellStrLns [ comment "hlint" ]
         foldedTellStrLns FoldHLint "HLint.." folds $ do
             forM_ pkgs $ \Pkg{pkgName,pkgGpd} -> do
@@ -908,7 +945,7 @@ genTravisFromConfigs (argv,opts) xpkgs isCabalProject config prj@Project { prjPa
                 let args = doctestArgs pkgGpd
                     args' = unwords args
                 unless (null args) $ tellStrLns
-                    [ sh $ "if [ $HCNUMVER -eq 80202 ]; then (cd " ++ pkgName ++ "-* && hlint" ++ hlintOptions ++ " " ++ args' ++ "); fi"
+                    [ sh $ "if [ $HCNUMVER -eq 80403 ]; then (cd " ++ pkgName ++ "-* && hlint" ++ hlintOptions ++ " " ++ args' ++ "); fi"
                     ]
         tellStrLns [ "" ]
 
@@ -929,15 +966,6 @@ genTravisFromConfigs (argv,opts) xpkgs isCabalProject config prj@Project { prjPa
             , ""
             ]
 
-    let constraintSets = cfgConstraintSets config
-    forM_ constraintSets $ \cs -> do
-        let name = csName cs
-        let constraintFlags = concatMap (\x ->  " --constraint='" ++ x ++ "'") (csConstraints cs)
-        foldedTellStrLns' FoldConstraintSets name ("Constraint set " ++ name) folds $ tellStrLns
-            [ sh' [2086] $ "if " ++ ghcVersionPredicate (csGhcVersions cs) ++ "; then cabal new-build -w ${HC} --disable-tests --disable-benchmarks" ++ constraintFlags ++ " all; else echo skipping...; fi"
-            , ""
-            ]
-
     unless (null colls) $
         foldedTellStrLns FoldStackage "Stackage builds..." folds $ tellStrLns
             [ "  # try building & testing for package collections"
@@ -953,6 +981,39 @@ genTravisFromConfigs (argv,opts) xpkgs isCabalProject config prj@Project { prjPa
             , ""
             ]
 
+    -- Have to build last, as we remove cabal.project.local
+    when (cfgUnconstrainted config) $ foldedTellStrLns FoldBuildInstalled
+        "Building without installed constraints for packages in global-db..." folds $ tellStrLns
+        [ comment "Build without installed constraints for packages in global-db"
+        -- SC2046: Quote this to prevent word splitting.
+        -- here we split on purpose!
+        , sh' [2046, 2086] $ unwords
+            [ "if $UNCONSTRAINED;"
+            , "then rm -f cabal.project.local; echo cabal new-build -w ${HC} --disable-tests --disable-benchmarks all;"
+            , "else echo \"Not building without installed constraints\"; fi"
+            ]
+        , ""
+        ]
+
+    -- and now, as we don't have cabal.project.local;
+    -- we can test with other constraint sets
+    let constraintSets = cfgConstraintSets config
+    unless (null constraintSets) $ do
+        tellStrLns
+            [ comment "Constraint sets"
+            , sh "rm -rf cabal.project.local"
+            , ""
+            ]
+        forM_ constraintSets $ \cs -> do
+            let name = csName cs
+            let constraintFlags = concatMap (\x ->  " --constraint='" ++ x ++ "'") (csConstraints cs)
+            tellStrLns [ comment  "Constraint set " ++ name ]
+            foldedTellStrLns' FoldConstraintSets name ("Constraint set " ++ name) folds $ tellStrLns
+                [ sh' [2086] $ "if " ++ ghcVersionPredicate (csGhcVersions cs) ++ "; then cabal new-build -w ${HC} --disable-tests --disable-benchmarks" ++ constraintFlags ++ " all; else echo skipping...; fi"
+                , ""
+                ]
+        tellStrLns [""]
+
     tellStrLns
         [ "# REGENDATA " ++ show argv
         , "# EOF"
@@ -963,7 +1024,8 @@ genTravisFromConfigs (argv,opts) xpkgs isCabalProject config prj@Project { prjPa
     hasTests   = F.any (\Pkg{pkgGpd} -> not . null $ condTestSuites pkgGpd) pkgs
     hasLibrary = F.any (\Pkg{pkgGpd} -> isJust $ condLibrary pkgGpd) pkgs
 
-    headGhcVers = S.filter isGhcHead versions
+    -- GHC versions which need head.hackage
+    headGhcVers = S.filter previewGHC versions
 
     generateCabalProject dist = do
         tellStrLns
@@ -985,8 +1047,30 @@ genTravisFromConfigs (argv,opts) xpkgs isCabalProject config prj@Project { prjPa
                 [ sh $ "echo 'package " ++ pkgName ++ "' >> cabal.project"
                 , sh $ "echo '  ghc-options: " ++ s ++ "' >> cabal.project"
                 ]
+
+        -- also write cabal.project.local file with
+        -- @
+        -- constraints: base installed
+        -- constraints: array installed
+        -- ...
+        --
+        -- omitting any local package names
         tellStrLns
-            [ sh $ "cat cabal.project"
+            [ sh $ "touch cabal.project.local"
+            , sh $ unwords
+                [ "if ! $NOINSTALLEDCONSTRAINTS; then"
+                , "for pkg in $($HCPKG list --simple-output); do"
+                , "echo $pkg"
+                , concatMap (\Pkg{pkgName} -> " | grep -vw -- " ++ pkgName) pkgs
+                , "| sed 's/^/constraints: /'"
+                , "| sed 's/-[^-]*$/ installed/'"
+                , ">> cabal.project.local; done; fi"
+                ]
+            ]
+
+        tellStrLns
+            [ sh $ "cat cabal.project || true"
+            , sh $ "cat cabal.project.local || true"
             ]
       where
         cabalPaths
@@ -1001,41 +1085,32 @@ genTravisFromConfigs (argv,opts) xpkgs isCabalProject config prj@Project { prjPa
       where
         quote pkg = pkg{ pkgDir = "\"" ++ pkgDir pkg ++ "\"" }
 
-    showVersions :: Set Version -> String
+    showVersions :: Set (Maybe Version) -> String
     showVersions = unwords . map dispGhcVersion . S.toList
 
     -- specified ersions
     osxVersions' :: Set Version
     osxVersions' = S.fromList $ mapMaybe simpleParse $ optOsx opts
 
+    versions :: Set (Maybe Version)
+    versions
+        | cfgGhcHead config = S.insert Nothing $ S.map Just versions'
+        | otherwise         = S.map Just versions'
+
     ghcVersions :: String
     ghcVersions = showVersions versions
 
     osxVersions, omittedOsxVersions :: Set Version
-    (osxVersions, omittedOsxVersions) = S.partition (`S.member` versions) osxVersions'
+    (osxVersions, omittedOsxVersions) = S.partition (`S.member` versions') osxVersions'
 
     ghcOsxVersions :: String
-    ghcOsxVersions = showVersions osxVersions
+    ghcOsxVersions = showVersions $ S.map Just osxVersions
 
     ghcOmittedOsxVersions :: String
-    ghcOmittedOsxVersions = showVersions omittedOsxVersions
+    ghcOmittedOsxVersions = showVersions $ S.map Just omittedOsxVersions
 
-    lookupCabVer :: Version -> Version
-    lookupCabVer v = fromMaybe (error "internal error") $ lookup (x,y) cabalVerMap
-      where
-        (x,y) = ghcMajVer v
-        cabalVerMap = fmap (fmap mkVersion)
-                      [ ((7, 0),  [1,25]) -- Use HEAD for everything.
-                      , ((7, 2),  [1,25])
-                      , ((7, 4),  [1,25])
-                      , ((7, 6),  [1,25])
-                      , ((7, 8),  [1,25])
-                      , ((7,10),  [1,25])
-                      , ((8, 0),  [1,25])
-                      , ((8, 2),  [1,25])
-                      , ((8, 4),  [1,25])
-                      , ((8, 5),  [1,25])
-                      ]
+    lookupCabVer :: Version -> Maybe Version
+    lookupCabVer v = join $ lookup (ghcMajVer v) cabalVerMap
 
 -- | Modules arguments to the library
 --
@@ -1211,9 +1286,12 @@ options =
     , Option [] ["no-no-tests-no-bench"]
       (NoArg $ successCM $ \cfg -> cfg { cfgNoTestsNoBench = False })
       "Don't build with --no-tests --no-benchmarks"
-    , Option [] ["no-installed"]
-      (NoArg $ successCM $ \cfg -> cfg { cfgInstalled = False })
-      "Don't build with 'installed' constraints"
+    , Option [] ["no-unconstrained"]
+      (NoArg $ successCM $ \cfg -> cfg { cfgUnconstrainted = False })
+      "Build also without 'installed' constraints"
+    , Option [] ["ghc-head"]
+      (NoArg $ successCM $ \cfg -> cfg { cfgGhcHead = True })
+      "Build also with ghc-head"
     , Option ['c'] ["collection"]
       (ReqArg (success' $ \arg opts -> opts { optCollections = arg : optCollections opts }) "CID")
       "enable package collection(s) (e.g. 'lts-7'), use multiple times for multiple collections"
@@ -1254,15 +1332,36 @@ options =
     , Option [] ["doctest-options"]
       (reqArgReadP parseOptsQ (\xs cfg -> cfg { cfgDoctestOptions = xs }) "OPTIONS")
       "Additional doctest options."
+    , Option [] ["doctest-version"]
+      (reqArgReadP parse (\arg cfg -> cfg { cfgDoctestVersion = arg }) "VERSION")
+      "Doctest version range"
     , Option ['l'] ["hlint"]
       (NoArg $ successCM $ \cfg -> cfg { cfgHLint = True })
-      "Run hlint (only on GHC-8.2.2 target)"
+      "Run hlint (only on GHC-8.4.3 target)"
     , Option [] ["hlint-yaml"]
       (ReqArg (successCM' $ \arg cfg -> cfg { cfgHLintYaml = Just arg }) "HLINT.YAML")
       "Relative path to .hlint.yaml."
+    , Option [] ["hlint-options"]
+      (reqArgReadP parseOptsQ (\xs cfg -> cfg { cfgHLintOptions = xs }) "OPTIONS")
+      "Additional hlint options."
     , Option [] ["hlint-version"]
       (reqArgReadP parse (\arg cfg -> cfg { cfgHLintVersion = arg }) "VERSION")
       "HLint version range"
+    , Option [] ["cabal-install-version"]
+      (reqArgReadP parse (\arg cfg -> cfg { cfgCabalInstallVersion = Just arg }) "VERSION")
+      "cabal-install version for all jobs, overrides default"
+    , Option [] ["cabal-install-head"]
+      (NoArg $ successCM $ \cfg -> cfg { cfgCabalInstallVersion = Nothing })
+      "Use cabal-install-head for all jobs, overrides default"
+    , Option [] ["env"]
+      (reqArgReadP envP (\(k, v) cfg -> cfg { cfgEnv = M.insert k v (cfgEnv cfg) }) "ENVDECL")
+      "Environment (e.g. `8.0.2:HADDOCK=false`)"
+    , Option [] ["allow-failure"]
+      (reqArgReadP parse (\arg cfg -> cfg { cfgAllowFailures = S.insert arg (cfgAllowFailures cfg) }) "GHCVERSION")
+      "Allow failures of particular GHC version"
+    , Option [] ["last-in-series"]
+      (NoArg $ successCM $ \cfg -> cfg { cfgLastInSeries = True })
+      "[Discouraged] Assume there are only GHCs last in major series: 8.0.* will match only 8.2.2"
     ]
   where
     overCM f opts = opts
@@ -1279,6 +1378,15 @@ options =
         Nothing -> Failure [Error $  "cannot parse: " ++ arg ]
         Just x  -> successCM' f x
 
+    envP :: ReadP r (Version, String)
+    envP = do
+        ghc <- parse
+        skipSpaces
+        _ <- char ':'
+        skipSpaces
+        v <- munch (const True)
+        return (ghc, v)
+
 -------------------------------------------------------------------------------
 -- Result
 -------------------------------------------------------------------------------
@@ -1291,7 +1399,7 @@ data Result e a
 success :: a -> Result e a
 success = Success []
 
-instance Monoid a => Monoid (Result e a) where
+instance Monoid a => Mon.Monoid (Result e a) where
     mempty = success mempty
 #if MIN_VERSION_base(4,9,0)
     mappend = (<>)
@@ -1358,9 +1466,11 @@ parseFoldQ = do
 -------------------------------------------------------------------------------
 
 data Config = Config
-    { cfgHLint           :: !Bool
+    { cfgCabalInstallVersion :: Maybe Version
+    , cfgHLint           :: !Bool
     , cfgHLintYaml       :: !(Maybe FilePath)
     , cfgHLintVersion    :: !VersionRange
+    , cfgHLintOptions    :: [String]
     , cfgJobs            :: (Maybe Int, Maybe Int)
     , cfgDoctest         :: !Bool
     , cfgDoctestOptions  :: [String]
@@ -1371,20 +1481,26 @@ data Config = Config
     , cfgCheck           :: !Bool
     , cfgNoise           :: !Bool
     , cfgNoTestsNoBench  :: !Bool
-    , cfgInstalled       :: !Bool
+    , cfgUnconstrainted  :: !Bool
     , cfgInstallDeps     :: !Bool
     , cfgOnlyBranches    :: [String]
     , cfgIrcChannels     :: [String]
     , cfgProjectName     :: Maybe String
     , cfgFolds           :: Set Fold
+    , cfgGhcHead         :: !Bool
+    , cfgEnv             :: M.Map Version String
+    , cfgAllowFailures   :: S.Set Version
+    , cfgLastInSeries    :: !Bool
     }
   deriving (Show)
 
 emptyConfig :: Config
 emptyConfig = Config
-    { cfgHLint           = False
+    { cfgCabalInstallVersion = Nothing
+    , cfgHLint           = False
     , cfgHLintYaml       = Nothing
     , cfgHLintVersion    = defaultHLintVersion
+    , cfgHLintOptions    = []
     , cfgJobs            = (Nothing, Nothing)
     , cfgDoctest         = False
     , cfgDoctestOptions  = []
@@ -1395,12 +1511,16 @@ emptyConfig = Config
     , cfgCheck           = True
     , cfgNoise           = True
     , cfgNoTestsNoBench  = True
-    , cfgInstalled       = True
+    , cfgUnconstrainted  = True
     , cfgInstallDeps     = True
     , cfgOnlyBranches    = []
     , cfgIrcChannels     = []
     , cfgProjectName     = Nothing
     , cfgFolds           = S.empty
+    , cfgGhcHead         = False
+    , cfgEnv             = M.empty
+    , cfgAllowFailures   = S.empty
+    , cfgLastInSeries    = False
     }
 
 configFieldDescrs :: [PU.FieldDescr Config]
@@ -1423,6 +1543,7 @@ configFieldDescrs =
         parse
         cfgHLintVersion
         (\x cfg -> cfg { cfgHLintVersion = x })
+    -- TODO: hlint-options
     , PU.boolField  "doctest"
         cfgDoctest
         (\b cfg -> cfg { cfgDoctest = b })
@@ -1436,6 +1557,11 @@ configFieldDescrs =
         parse
         cfgDoctestVersion
         (\x cfg -> cfg { cfgDoctestVersion = x })
+    , PU.simpleField "cabal-install-version"
+        (error "we don't pretty print")
+        (fmap Just parse)
+        cfgCabalInstallVersion
+        (\x cfg -> cfg { cfgCabalInstallVersion = x })
     , PU.simpleField "local-ghc-options"
         (error "we don't pretty print")
         parseOptsQ
@@ -1456,9 +1582,9 @@ configFieldDescrs =
     , PU.boolField  "no-tests-no-benchmarks"
         cfgNoTestsNoBench
         (\b cfg -> cfg { cfgNoTestsNoBench = b })
-    , PU.boolField  "build-with-installed-step"
-        cfgInstalled
-        (\b cfg -> cfg { cfgInstalled = b })
+    , PU.boolField  "unconstrained-step"
+        cfgUnconstrainted
+        (\b cfg -> cfg { cfgUnconstrainted = b })
     , PU.listField  "irc-channels"
         (error "we don't pretty print")
         PU.parseTokenQ
@@ -1479,6 +1605,10 @@ configFieldDescrs =
         (sepBy parseFoldQ (munch1 isSpace))
         (\cfg -> [\_ -> cfgFolds cfg])
         (\x cfg -> cfg { cfgFolds = foldl' (flip id) (cfgFolds cfg) x })
+    , PU.boolField "ghc-head"
+        cfgGhcHead
+        (\b cfg -> cfg { cfgGhcHead = b })
+    -- , PU.simpleField "env" -- TODO
     ]
 
 parseOptsQ :: ReadP r [String]
@@ -1688,8 +1818,7 @@ parseFilePathGlobRel =
       <++ asFile globpieces
   where
     asDir  glob = do dirSep
-                     globs <- parseFilePathGlobRel
-                     return (GlobDir glob globs)
+                     GlobDir glob <$> parseFilePathGlobRel
     asTDir glob = do dirSep
                      return (GlobDir glob GlobDirTrailing)
     asFile glob = return (GlobFile glob)
@@ -1746,7 +1875,7 @@ expandRelGlob root glob0 = liftIO $ go glob0 ""
       subdirs <- filterM (\subdir -> doesDirectoryExist
                                        (root </> dir </> subdir))
                $ filter (matchGlob glob) entries
-      concat <$> mapM (\subdir -> go globPath (dir </> subdir)) subdirs
+      concat App.<$> mapM (\subdir -> go globPath (dir </> subdir)) subdirs
 
     go GlobDirTrailing dir = return [dir]
 
