@@ -121,25 +121,26 @@ knownGhcVersions = fmap mkVersion
     , [7,10,1], [7,10,2], [7,10,3]
     , [8,0,1],  [8,0,2]
     , [8,2,1],  [8,2,2]
-    , [8,4,1],  [8,4,2], [8,4,3]
-    , [8,6,1]
+    , [8,4,1],  [8,4,2], [8,4,3], [8,4,4]
+    , [8,6,1],  [8,6,2], [8,6,3]
     ]
 
 ghcAlpha :: Maybe Version
--- ghcAlpha = Nothing
-ghcAlpha = Just (mkVersion [8,6,1])
+ghcAlpha = Nothing
+-- ghcAlpha = Just (mkVersion [8,8,1])
 
 cabalVerMap :: [((Int, Int), Maybe Version)]
 cabalVerMap = fmap (fmap (fmap mkVersion))
-    [ ((7, 0), Just [2,2]) -- Use 2.2 for everything.
-    , ((7, 2), Just [2,2])
-    , ((7, 4), Just [2,2])
-    , ((7, 6), Just [2,2])
-    , ((7, 8), Just [2,2])
-    , ((7,10), Just [2,2])
-    , ((8, 0), Just [2,2])
-    , ((8, 2), Just [2,2])
-    , ((8, 4), Just [2,2])
+    [ ((7, 0), Just [2,4]) -- Use 2.4 for everything.
+    , ((7, 2), Just [2,4])
+    , ((7, 4), Just [2,4])
+    , ((7, 6), Just [2,4])
+    , ((7, 8), Just [2,4])
+    , ((7,10), Just [2,4])
+    , ((8, 0), Just [2,4])
+    , ((8, 2), Just [2,4])
+    , ((8, 4), Just [2,4])
+    , ((8, 6), Just [2,4])
     ]
 
 defaultHLintVersion :: VersionRange
@@ -166,9 +167,9 @@ sh' _ = shImpl
 #else
 sh' excl cmd = unsafePerformIO $ do
   res <- checkScript iface spec
-  case res of
-    (SC.CheckResult _ []) -> return (shImpl cmd)
-    _                     -> SC.onResult scFormatter res iface >> fail "ShellCheck!"
+  if null (SC.crComments res)
+     then return (shImpl cmd)
+     else SC.onResult scFormatter res iface >> fail "ShellCheck!"
   where
     iface = SC.SystemInterface $ \n -> return $ Left $ "cannot read file: " ++ n
     spec  = SC.emptyCheckSpec { SC.csFilename = "stdin"
@@ -178,7 +179,7 @@ sh' excl cmd = unsafePerformIO $ do
                               }
 
 scFormatter :: SC.Formatter
-scFormatter = unsafePerformIO (SC.TTY.format (SC.FormatterOptions SC.ColorAlways))
+scFormatter = unsafePerformIO (SC.TTY.format (SC.newFormatterOptions { SC.foColorOption = SC.ColorAlways }))
 #endif
 
 -- Non-ShellCheck version of sh'
@@ -797,6 +798,12 @@ genTravisFromConfigs (argv,opts) xpkgs isCabalProject config prj@Project { prjPa
         [ sh "grep -Ev -- '^\\s*--' ${HOME}/.cabal/config | grep -Ev '^\\s*$'"
         ]
 
+    -- Initialise store
+    -- https://github.com/haskell/cabal/issues/5516
+    when (cfgDoctest config || cfgHLint config) $ tellStrLns
+        [ sh "(cd /tmp && echo '' | cabal new-repl -w ${HC} --build-dep fail)"
+        ]
+
     -- Install doctest
     let doctestVersionConstraint
             | isAnyVersion (cfgDoctestVersion config) = ""
@@ -868,12 +875,11 @@ genTravisFromConfigs (argv,opts) xpkgs isCabalProject config prj@Project { prjPa
         ]
 
     foldedTellStrLns FoldSDist "Packaging..." folds $ do
-        forM_ pkgs $ \Pkg{pkgDir} -> tellStrLns
-            [ sh $ "(cd \"" ++ pkgDir ++ "\" && cabal sdist)"
+        tellStrLns
+            [ sh $ "cabal new-sdist all"
             ]
 
-    let tarFiles = quotedPaths $ \Pkg{pkgDir,pkgName} ->
-                pkgDir </> "dist" </> pkgName ++ "-*.tar.gz"
+    let tarFiles = "dist-newstyle" </> "sdist" </> "*.tar.gz"
 
 
     foldedTellStrLns FoldUnpack "Unpacking..." folds $ do
@@ -961,7 +967,6 @@ genTravisFromConfigs (argv,opts) xpkgs isCabalProject config prj@Project { prjPa
     when hasLibrary $
         foldedTellStrLns FoldHaddock "Haddock..." folds $ tellStrLns
             [ comment "haddock"
-            , sh "rm -rf ./dist-newstyle"
             , sh "if $HADDOCK; then cabal new-haddock -w ${HC} ${TEST} ${BENCH} all; else echo \"Skipping haddock generation\";fi"
             , ""
             ]
@@ -1030,6 +1035,7 @@ genTravisFromConfigs (argv,opts) xpkgs isCabalProject config prj@Project { prjPa
     generateCabalProject dist = do
         tellStrLns
             [ sh $ "printf 'packages: " ++ cabalPaths ++ "\\n' > cabal.project"
+            , sh $ "printf 'write-ghc-environment-files: always\\n' >> cabal.project"
             ]
         F.forM_ (prjConstraints prj) $ \xs -> do
             let s = concat (lines xs)
